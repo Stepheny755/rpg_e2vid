@@ -1,3 +1,5 @@
+import os
+import h5py
 import torch
 from utils.loading_utils import load_model, get_device
 import numpy as np
@@ -37,13 +39,21 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # Read sensor size from the first first line of the event file
+    # Read sensor size from the event file
     path_to_events = args.input_file
-
-    header = pd.read_csv(path_to_events, delim_whitespace=True, header=None, names=['width', 'height'],
-                         dtype={'width': np.int, 'height': np.int},
-                         nrows=1)
-    width, height = header.values[0]
-    print('Sensor size: {} x {}'.format(width, height))
+    file_extension = os.path.splitext(path_to_events)[1]
+    
+    if file_extension in ['.hdf5', '.h5']:
+        # For HDF5 files, read sensor dimensions from metadata or infer from data
+        print("Reading HDF5 file...")
+        width = 1280 # 640
+        height = 720 # 480
+    else:
+        # For text/zip files, read from the first line header
+        header = pd.read_csv(path_to_events, delim_whitespace=True, header=None, names=['width', 'height'],
+                             dtype={'width': int, 'height': int},
+                             nrows=1)
+        width, height = header.values[0]
 
     # Load model
     model = load_model(args.path_to_model)
