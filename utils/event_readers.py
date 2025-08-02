@@ -5,6 +5,7 @@ import numpy as np
 import tqdm
 from .timers import Timer
 import h5py
+import pandas as pd
 
 
 class FixedSizeEventReader:
@@ -182,9 +183,8 @@ class FixedDurationEventReader:
     Reads events from a '.txt', '.zip', or '.hdf5' file, and packages the events into
     non-overlapping event windows, each of a fixed duration.
 
-    **Note**: This reader is much slower than the FixedSizeEventReader for txt/zip files.
-              The reason is that the latter can use Pandas' very efficient chunk-based reading scheme implemented in C.
-              However, HDF5 files are read efficiently using h5py.
+    **Note**: HDF5 files are now read efficiently using pandas DataFrame approach.
+              Text/zip files maintain the original line-by-line reading for memory efficiency.
     """
 
     def __init__(self, path_to_event_file, duration_ms=50.0, start_index=0, 
@@ -206,13 +206,15 @@ class FixedDurationEventReader:
         self.y_max = y_max
         
         self.duration_s = duration_ms / 1000.0
+        self.duration_us = duration_ms * 1000.0  # For HDF5 microsecond timestamps
         self.last_stamp = None
         self.start_index = start_index
         
         if self.is_hdf5_file:
-            # For HDF5, we'll load all events at once and then iterate through them
-            self._load_hdf5_events()
-            self.current_event_index = start_index
+            # Use efficient pandas-based loading for HDF5
+            self._load_hdf5_events_efficient()
+            self.current_index = 0
+            self.timestamps_in_seconds = None
         else:
             # Initialize file readers for txt/zip files
             if self.is_zip_file:  # '.zip'
@@ -227,35 +229,105 @@ class FixedDurationEventReader:
             for i in range(1 + start_index):
                 self.event_file.readline()
 
-    def _load_hdf5_events(self):
-        """Load all events from HDF5 file into memory"""
-        print("Loading HDF5 events...")
+    def _load_hdf5_events_efficient(self):
+        """Load HDF5 events efficiently using pandas DataFrame approach"""
+        print(f"Loading HDF5 file efficiently: {self.path_to_event_file}")
+
         with h5py.File(self.path_to_event_file, 'r') as f:
-            dataset = f['CD/events']
-            
-            # Pre-allocate lists for better performance
-            self.events = []
-            
-            for e in dataset:
-                x, y, p, ts = e
+            # Access the CD/events dataset
+            if 'CD/events' not in f:
+                raise ValueError("Dataset 'CD/events' not found in HDF5 file")
+
+            events_dataset = f['CD/events']
+            print(f"Found {len(events_dataset)} total events")
+
+            # Load all events
+            all_events = events_dataset[:]
+            df_dict = self._parse_events_structure(all_events)
+
+        # Create DataFrame with standardized column names
+        self.df = self._create_standardized_dataframe(df_dict)
+
+        # Apply coordinate filtering if specified
+        if self.x_max is not None and self.y_max is not None:
+            mask = (
+                (self.df['x'] >= self.x_min) & 
+                (self.df['y'] >= self.y_min) & 
+                (self.df['x'] < self.x_max) & 
+                (self.df['y'] < self.y_max)
+            )
+            self.df = self.df[mask].reset_index(drop=True)
+            print(f"After coordinate filtering: {len(self.df)} events")
+
+        # Adjust coordinates by offset
+        self.df['x'] = self.df['x'] - self.x_min
+        self.df['y'] = self.df['y'] - self.y_min
+
+        # Apply start_index
+        if self.start_index > 0:
+            self.df = self.df.iloc[self.start_index:].reset_index(drop=True)
+            print(f"After start_index filtering: {len(self.df)} events")
+
+        # Sort by timestamp for efficient time-based queries
+        self.df = self.df.sort_values('timestamp').reset_index(drop=True)
+        
+        print(f"Loaded {len(self.df)} events efficiently")
+        if len(self.df) > 0:
+            print(f"Time range: {self.df['timestamp'].min()} to {self.df['timestamp'].max()}")
+
+    def _parse_events_structure(self, all_events):
+        """Parse the structure of events data (structured vs regular array)."""
+        if hasattr(all_events.dtype, 'names') and all_events.dtype.names:
+            # Structured array with named fields
+            print(f"Event fields: {all_events.dtype.names}")
+            return {field: all_events[field] for field in all_events.dtype.names}
+        else:
+            # Regular array - assume columns are [x, y, p, t] or [t, x, y, p]
+            print("Events are in regular array format")
+            if all_events.shape[1] >= 4:
+                # Try to detect timestamp column (usually much larger values)
+                col_means = np.mean(all_events, axis=0)
+                timestamp_col = np.argmax(col_means)  # Timestamp usually has largest values
                 
-                # Apply coordinate filtering if specified
-                if self.x_max is not None and self.y_max is not None:
-                    if x < self.x_min or y < self.y_min or x >= self.x_max or y >= self.y_max:
-                        continue
-                
-                # Store as [timestamp_in_seconds, x, y, polarity]
-                # Adjust coordinates by offset and convert timestamp to seconds
-                self.events.append([
-                    ts,
-                    x - self.x_min,
-                    y - self.y_min,
-                    p
-                ])
-            
-            # Convert to numpy array for efficient indexing
-            self.events = np.array(self.events)
-            print(f"Loaded {len(self.events)} events from HDF5 file")
+                if timestamp_col == 0:  # [t, x, y, p]
+                    return {
+                        't': all_events[:, 0],
+                        'x': all_events[:, 1],
+                        'y': all_events[:, 2],
+                        'p': all_events[:, 3]
+                    }
+                else:  # [x, y, p, t]
+                    return {
+                        'x': all_events[:, 0],
+                        'y': all_events[:, 1],
+                        'p': all_events[:, 2],
+                        't': all_events[:, 3]
+                    }
+            else:
+                raise ValueError(f"Unexpected event array shape: {all_events.shape}")
+
+    def _create_standardized_dataframe(self, df_dict):
+        """Create DataFrame with standardized column names."""
+        field_mapping = {
+            't': 'timestamp', 'time': 'timestamp', 'ts': 'timestamp',
+            'x': 'x', 'y': 'y',
+            'p': 'polarity', 'pol': 'polarity', 'polarity': 'polarity'
+        }
+
+        standardized_dict = {}
+        for field, data in df_dict.items():
+            standard_name = field_mapping.get(field, field)
+            standardized_dict[standard_name] = data
+
+        df = pd.DataFrame(standardized_dict)
+
+        # Validate required columns
+        if 'timestamp' not in df.columns:
+            raise ValueError("No timestamp column found in event data")
+        if 'x' not in df.columns or 'y' not in df.columns:
+            raise ValueError("No x,y coordinate columns found in event data")
+
+        return df
 
     def __iter__(self):
         return self
@@ -269,34 +341,46 @@ class FixedDurationEventReader:
 
     def __next__(self):
         if self.is_hdf5_file:
-            return self._next_hdf5_window()
+            return self._next_hdf5_window_efficient()
         else:
             return self._next_text_window()
 
-    def _next_hdf5_window(self):
-        """Get next event window from HDF5 data"""
-        if self.current_event_index >= len(self.events):
+    def _next_hdf5_window_efficient(self):
+        """Get next event window from HDF5 data using efficient pandas operations"""
+        if len(self.df) == 0:
             raise StopIteration
         
-        event_list = []
-        start_index = self.current_event_index
-        
-        # Get the timestamp of the first event in this window
+        # Initialize last_stamp on first call - HDF5 timestamps are in microseconds
         if self.last_stamp is None:
-            self.last_stamp = self.events[start_index][0]  # timestamp is first element
+            # Convert first timestamp from microseconds to seconds
+            self.last_stamp = self.df['timestamp'].iloc[0] / 1e6
+            # Pre-convert all timestamps to seconds for efficiency
+            self.timestamps_in_seconds = self.df['timestamp'].values / 1e6
+            self.current_index = 0
+        
+        if self.current_index >= len(self.df):
+            raise StopIteration
         
         # Collect events within the duration window
-        while self.current_event_index < len(self.events):
-            event = self.events[self.current_event_index]
-            t = event[0]  # timestamp
+        event_list = []
+        window_end = self.last_stamp + self.duration_s
+        
+        while self.current_index < len(self.df):
+            event_timestamp = self.timestamps_in_seconds[self.current_index]
             
-            if t > self.last_stamp + self.duration_s:
-                self.last_stamp = t
+            if event_timestamp > window_end:
+                # This event starts the next window
+                self.last_stamp = event_timestamp
                 break
             
-            # Reorder to [t, x, y, pol] format to match original class
-            event_list.append([t, event[1], event[2], event[3]])
-            self.current_event_index += 1
+            # Add event to current window
+            row = self.df.iloc[self.current_index]
+            x_coord = row['x']
+            y_coord = row['y']
+            polarity = row.get('polarity', 1)  # Default to 1 if no polarity
+            
+            event_list.append([event_timestamp, x_coord, y_coord, polarity])
+            self.current_index += 1
         
         if not event_list:
             raise StopIteration
@@ -311,7 +395,18 @@ class FixedDurationEventReader:
                 line = line.decode("utf-8")
             t, x, y, pol = line.split(' ')
             t, x, y, pol = float(t), int(x), int(y), int(pol)
-            event_list.append([t, x, y, pol])
+            
+            # Apply coordinate filtering
+            if self.x_max is not None and self.y_max is not None:
+                if x < self.x_min or y < self.y_min or x >= self.x_max or y >= self.y_max:
+                    continue
+            
+            # Adjust coordinates by offset
+            x_adj = x - self.x_min
+            y_adj = y - self.y_min
+            
+            event_list.append([t, x_adj, y_adj, pol])
+            
             if self.last_stamp is None:
                 self.last_stamp = t
             if t > self.last_stamp + self.duration_s:
