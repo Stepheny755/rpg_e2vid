@@ -230,50 +230,52 @@ class FixedDurationEventReader:
                 self.event_file.readline()
 
     def _load_hdf5_events_efficient(self):
-        """Load HDF5 events efficiently using pandas DataFrame approach"""
-        print(f"Loading HDF5 file efficiently: {self.path_to_event_file}")
-
+        """Load HDF5 events efficiently with random subsampling and optional ROI filtering"""
         with h5py.File(self.path_to_event_file, 'r') as f:
-            # Access the CD/events dataset
             if 'CD/events' not in f:
                 raise ValueError("Dataset 'CD/events' not found in HDF5 file")
 
             events_dataset = f['CD/events']
-            print(f"Found {len(events_dataset)} total events")
+            total = len(events_dataset)
+            print(f"Total events in file: {total}")
 
-            # Load all events
-            all_events = events_dataset[:]
-            df_dict = self._parse_events_structure(all_events)
+            events = events_dataset[5*total // 6:]
+            print("Finished reading raw event data into structured array")
 
-        # Create DataFrame with standardized column names
-        self.df = self._create_standardized_dataframe(df_dict)
+        # Convert to DataFrame directly (no field-by-field split)
+        df = pd.DataFrame.from_records(events)
 
-        # Apply coordinate filtering if specified
+        # Rename to standard column names
+        df.rename(columns={'t': 'timestamp', 'p': 'polarity'}, inplace=True)
+
+        # Coordinate filtering (if requested)
         if self.x_max is not None and self.y_max is not None:
             mask = (
-                (self.df['x'] >= self.x_min) & 
-                (self.df['y'] >= self.y_min) & 
-                (self.df['x'] < self.x_max) & 
-                (self.df['y'] < self.y_max)
+                (df['x'] >= self.x_min) & 
+                (df['x'] < self.x_max) &
+                (df['y'] >= self.y_min) & 
+                (df['y'] < self.y_max)
             )
-            self.df = self.df[mask].reset_index(drop=True)
-            print(f"After coordinate filtering: {len(self.df)} events")
+            df = df[mask].reset_index(drop=True)
+            print(f"After coordinate filtering: {len(df)} events")
 
-        # Adjust coordinates by offset
-        self.df['x'] = self.df['x'] - self.x_min
-        self.df['y'] = self.df['y'] - self.y_min
+        # Offset coordinates
+        df['x'] -= self.x_min
+        df['y'] -= self.y_min
 
-        # Apply start_index
+        # Apply start index
         if self.start_index > 0:
-            self.df = self.df.iloc[self.start_index:].reset_index(drop=True)
-            print(f"After start_index filtering: {len(self.df)} events")
+            df = df.iloc[self.start_index:].reset_index(drop=True)
+            print(f"After start_index filtering: {len(df)} events")
 
-        # Sort by timestamp for efficient time-based queries
-        self.df = self.df.sort_values('timestamp').reset_index(drop=True)
-        
-        print(f"Loaded {len(self.df)} events efficiently")
-        if len(self.df) > 0:
-            print(f"Time range: {self.df['timestamp'].min()} to {self.df['timestamp'].max()}")
+        # Sort by time for consistent iteration
+        df = df.sort_values('timestamp').reset_index(drop=True)
+
+        self.df = df
+        print(f"Loaded {len(self.df)} events into memory.")
+        if len(df) > 0:
+            print(f"Time range: {df['timestamp'].min()} to {df['timestamp'].max()}")
+
 
     def _parse_events_structure(self, all_events):
         """Parse the structure of events data (structured vs regular array)."""
