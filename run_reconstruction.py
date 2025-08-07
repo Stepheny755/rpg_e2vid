@@ -46,8 +46,8 @@ if __name__ == "__main__":
     if file_extension in ['.hdf5', '.h5']:
         # For HDF5 files, read sensor dimensions from metadata or infer from data
         print("Reading HDF5 file...")
-        width = 640 # 1280 
-        height = 480 # 720 
+        width = 1280 
+        height = 720 
     else:
         # For text/zip files, read from the first line header
         header = pd.read_csv(path_to_events, delim_whitespace=True, header=None, names=['width', 'height'],
