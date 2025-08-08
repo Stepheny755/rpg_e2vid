@@ -499,3 +499,213 @@ class FixedDurationEventReader:
                 return event_window
 
         raise StopIteration
+
+
+class FixedDurationChunkEventReader:
+    """
+    Reads events from a '.hdf5' file in chunks, and packages the events into
+    non-overlapping event windows, each of a fixed duration.
+    
+    This reader is memory-efficient for very large HDF5 files as it reads
+    events in configurable chunks rather than loading the entire file into memory.
+    """
+
+    def __init__(
+        self,
+        path_to_event_file,
+        duration_ms=50.0,
+        start_index=0,
+        x_min=0,
+        y_min=0,
+        x_max=None,
+        y_max=None,
+        chunk_size=300000000,  # Default 300 million events per chunk
+    ):
+        print(
+            "Will use fixed duration event windows of size {:.2f} ms".format(
+                duration_ms
+            )
+        )
+        print("Output frame rate: {:.1f} Hz".format(1000.0 / duration_ms))
+        print(f"Using chunk size: {chunk_size} events")
+
+        file_extension = splitext(path_to_event_file)[1]
+        assert file_extension in [".hdf5", ".h5"], "FixedDurationChunkEventReader only supports HDF5 files"
+
+        self.path_to_event_file = path_to_event_file
+        self.chunk_size = chunk_size
+
+        # Coordinate bounds for filtering (optional)
+        self.x_min = x_min
+        self.y_min = y_min
+        self.x_max = x_max
+        self.y_max = y_max
+
+        self.duration_s = duration_ms / 1000.0
+        self.last_stamp = None
+        self.start_index = start_index
+
+        # Initialize HDF5 file and chunk reading
+        self._init_hdf5_chunked()
+        
+        # State for chunk-based processing
+        self._current_chunk_index = 0
+        self._current_chunk_data = None
+        self._current_chunk_position = 0
+        self._event_buffer = []  # Buffer for events that span chunk boundaries
+        self._finished = False
+
+    def _init_hdf5_chunked(self):
+        """Initialize HDF5 file for chunked reading"""
+        self._hdf5_file = h5py.File(self.path_to_event_file, "r")
+        if "CD/events" not in self._hdf5_file:
+            raise ValueError("Dataset 'CD/events' not found in HDF5 file")
+        
+        self._events_dataset = self._hdf5_file["CD/events"]
+        self._total_events = len(self._events_dataset)
+        print(f"Total events in HDF5 file: {self._total_events}")
+        
+        # Calculate starting position considering start_index
+        self._file_position = self.start_index
+        if self._file_position >= self._total_events:
+            print("Warning: start_index exceeds total events in file")
+            self._finished = True
+
+    def _load_next_chunk(self):
+        """Load the next chunk of events from HDF5 file"""
+        if self._file_position >= self._total_events:
+            self._current_chunk_data = None
+            return False
+
+        # Calculate chunk boundaries
+        chunk_start = self._file_position
+        chunk_end = min(chunk_start + self.chunk_size, self._total_events)
+        
+        print(f"Loading chunk: events {chunk_start} to {chunk_end-1}")
+        
+        # Read chunk from HDF5
+        raw_chunk = self._events_dataset[chunk_start:chunk_end]
+        
+        # Convert to DataFrame with standard column names
+        df = pd.DataFrame.from_records(raw_chunk)
+        df.rename(columns={"t": "timestamp", "p": "polarity"}, inplace=True)
+        
+        # Apply coordinate filtering if specified
+        if self.x_max is not None and self.y_max is not None:
+            mask = (
+                (df["x"] >= self.x_min)
+                & (df["x"] < self.x_max)
+                & (df["y"] >= self.y_min)
+                & (df["y"] < self.y_max)
+            )
+            df = df[mask].reset_index(drop=True)
+        
+        # Offset coordinates
+        df["x"] -= self.x_min
+        df["y"] -= self.y_min
+        
+        # Sort by timestamp to ensure proper temporal order
+        df = df.sort_values("timestamp").reset_index(drop=True)
+        
+        # Convert timestamps to seconds for consistency with other readers
+        df["timestamp"] = df["timestamp"] / 1e6
+        
+        self._current_chunk_data = df
+        self._current_chunk_position = 0
+        self._file_position = chunk_end
+        
+        print(f"Loaded chunk with {len(df)} events after filtering")
+        if len(df) > 0:
+            print(f"Chunk time range: {df['timestamp'].min():.6f} to {df['timestamp'].max():.6f} seconds")
+        
+        return len(df) > 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        """Get next fixed-duration event window"""
+        if self._finished:
+            raise StopIteration
+        
+        # Collect events for the current time window
+        event_list = []
+        
+        # Add any buffered events from previous window processing
+        event_list.extend(self._event_buffer)
+        self._event_buffer = []
+        
+        # Initialize last_stamp if this is the first window
+        if self.last_stamp is None:
+            # Need to find the first event timestamp
+            while True:
+                if self._current_chunk_data is None or self._current_chunk_position >= len(self._current_chunk_data):
+                    if not self._load_next_chunk():
+                        # No more data
+                        if event_list:
+                            return np.array(event_list)
+                        else:
+                            raise StopIteration
+                
+                if len(self._current_chunk_data) > 0:
+                    self.last_stamp = self._current_chunk_data["timestamp"].iloc[self._current_chunk_position]
+                    break
+        
+        window_end = self.last_stamp + self.duration_s
+        
+        while True:
+            # Check if we need to load a new chunk
+            if self._current_chunk_data is None or self._current_chunk_position >= len(self._current_chunk_data):
+                if not self._load_next_chunk():
+                    # No more chunks available
+                    if event_list:
+                        # Update last_stamp for next window (if any)
+                        if event_list:
+                            self.last_stamp = event_list[-1][0] + self.duration_s
+                        return np.array(event_list)
+                    else:
+                        self._finished = True
+                        raise StopIteration
+            
+            # Process events in current chunk
+            while self._current_chunk_position < len(self._current_chunk_data):
+                row = self._current_chunk_data.iloc[self._current_chunk_position]
+                event_timestamp = row["timestamp"]
+                
+                if event_timestamp > window_end:
+                    # This event belongs to the next window
+                    if event_list:
+                        # Store this event for the next window
+                        x_coord = int(row["x"])
+                        y_coord = int(row["y"])
+                        polarity = int(row.get("polarity", 1))
+                        self._event_buffer.append([event_timestamp, x_coord, y_coord, polarity])
+                        
+                        # Start next window from this event's timestamp
+                        self.last_stamp = event_timestamp
+                        return np.array(event_list)
+                    else:
+                        # Start the window from this event
+                        self.last_stamp = event_timestamp
+                        window_end = self.last_stamp + self.duration_s
+                
+                # Add event to current window
+                x_coord = int(row["x"])
+                y_coord = int(row["y"])
+                polarity = int(row.get("polarity", 1))
+                event_list.append([event_timestamp, x_coord, y_coord, polarity])
+                
+                self._current_chunk_position += 1
+            
+            # If we've processed all events in current chunk but haven't filled the window,
+            # continue to next chunk
+            continue
+
+    def __del__(self):
+        """Clean up HDF5 file handle"""
+        if hasattr(self, "_hdf5_file"):
+            try:
+                self._hdf5_file.close()
+            except:
+                pass
+

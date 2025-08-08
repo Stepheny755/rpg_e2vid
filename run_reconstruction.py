@@ -5,7 +5,7 @@ from utils.loading_utils import load_model, get_device
 import numpy as np
 import argparse
 import pandas as pd
-from utils.event_readers import FixedSizeEventReader, FixedDurationEventReader
+from utils.event_readers import FixedSizeEventReader, FixedDurationEventReader, FixedDurationChunkEventReader
 from utils.inference_utils import events_to_voxel_grid, events_to_voxel_grid_pytorch
 from utils.timers import Timer
 import time
@@ -91,7 +91,7 @@ if __name__ == "__main__":
         print('Will compute voxel grid on CPU.')
 
     if args.fixed_duration:
-        event_window_iterator = FixedDurationEventReader(path_to_events,
+        event_window_iterator = FixedDurationChunkEventReader(path_to_events,
                                                          duration_ms=args.window_duration,
                                                          start_index=start_index)
     else:
