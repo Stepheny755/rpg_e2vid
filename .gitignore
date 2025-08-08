@@ -2,3 +2,5 @@
 data/
 pretrained/
 results/
+
+*temp*.sh
